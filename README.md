@@ -15,8 +15,8 @@ LUST DADDY features a robust, user-friendly in-game UI to manipulate unit attrib
 
 2. **Turret & Weapon Swapping**
    - The UI automatically maps all available turret hardpoints on the selected unit.
-   - Select from a drop-down list of every turret in the game to perform seamless swaps (e.g., mounting a heavy naval CIWS onto a light truck).
-   - DADDY handles all the complex logic behind the scenes, safely stripping incompatible `ShipPart` components from naval turrets when mounted on land vehicles to prevent engine crashes, while keeping secondary child-guns perfectly synced.
+   - Select from a drop-down list of every turret in the game to perform seamless swaps (e.g., mounting an MBT turret onto a light truck).
+   - DADDY handles all the complex logic behind the scenes, safely stripping incompatible `ShipPart` components, so Naval turret are inaccessible by non-ship, but ship can mount either.
 
 3. **Live Parameter Tuning**
    - Dive into the component level to modify core vehicle stats like HitPoints, Radar Range, Armor, Mass, and Speed.
