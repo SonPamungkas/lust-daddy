@@ -2,7 +2,7 @@
 <img width="1594" height="1080" alt="L-Daddy (1)" src="https://github.com/user-attachments/assets/d98c2934-21cf-4eea-9e33-5403a5380622" />
 
 ## Description
-LUST (Loadout Utility & Swapping Tool) is a powerful, real-time in-game editor and modification framework for Nuclear Option that grants you absolute control over the game's vehicles, aircraft, and weapon platforms. 
+LUST (Loadout Utility & Swapping Tool) is an in-game unit editor and modification framework for Nuclear Option that grants you absolute control over the game's vehicles, building, and weapon platforms. 
 
 At the core of LUST is the **Dynamic Asset Deployment & Designation Yield (DADDY)** sub-system. DADDY intercepts the game's prefab instantiation sequence, allowing you to seamlessly transplant turrets, tweak base stats, and create monstrous hybrid units without ever touching a line of code. Because sometimes, units just need their DADDY to help them reach their true potential.
 
