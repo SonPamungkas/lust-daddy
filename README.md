@@ -27,7 +27,7 @@ LUST DADDY features a robust, user-friendly in-game UI to manipulate unit attrib
    - Upon restarting the game, DADDY intercepts the prefab generation sequence. It surgically injects your JSON configurations *before* instances are spawned, ensuring flawless integration with vanilla gameplay and the mission editor.
 
 ## Configuration & Usage
-1. Launch the game and press **F8** to open the LUST DADDY interface.
+1. Launch the game and press **F9** to open the LUST DADDY interface.
 2. Select a vehicle from the "Units" tab.
 3. Assign new turrets using the drop-down cycler, or scroll down to tweak base component stats (HP, speed, radar range, etc.).
 4. Click **Save Config**.
