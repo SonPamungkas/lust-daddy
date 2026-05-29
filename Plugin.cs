@@ -48,10 +48,19 @@ namespace LustDaddy
      }
 
      [System.Serializable]
+     public class WeaponStationSwapEntry
+     {
+         public string componentType;
+         public int stationIndex;
+         public string replacement;
+     }
+
+     [System.Serializable]
      public class UnitModConfig
      {
          public string unitId;
          public List<TurretSwapEntry> turretSwaps = new List<TurretSwapEntry>();
+         public List<WeaponStationSwapEntry> stationSwaps = new List<WeaponStationSwapEntry>();
          public List<FieldModEntry> fieldMods = new List<FieldModEntry>();
 
          public string ToJson()
@@ -65,6 +74,14 @@ namespace LustDaddy
                  var e = turretSwaps[i];
                  sb.Append($"    {{ \"slotName\": \"{Esc(e.slotName)}\", \"replacement\": \"{Esc(e.replacement)}\" }}");
                  sb.AppendLine(i < turretSwaps.Count - 1 ? "," : "");
+             }
+             sb.AppendLine("  ],");
+             sb.AppendLine("  \"stationSwaps\": [");
+             for (int i = 0; i < stationSwaps.Count; i++)
+             {
+                 var e = stationSwaps[i];
+                 sb.Append($"    {{ \"componentType\": \"{Esc(e.componentType)}\", \"stationIndex\": \"{e.stationIndex}\", \"replacement\": \"{Esc(e.replacement)}\" }}");
+                 sb.AppendLine(i < stationSwaps.Count - 1 ? "," : "");
              }
              sb.AppendLine("  ],");
              sb.AppendLine("  \"fieldMods\": [");
@@ -109,6 +126,39 @@ namespace LustDaddy
                              string repl = ExtractString(obj, "replacement");
                              if (!string.IsNullOrEmpty(slot) && !string.IsNullOrEmpty(repl))
                                  cfg.turretSwaps.Add(new TurretSwapEntry { slotName = slot, replacement = repl });
+                         }
+                     }
+                     else if (braceDepth > 0) current.Append(c);
+                     if (c == ']' && braceDepth == 0) break;
+                 }
+             }
+
+             // Extract stationSwaps
+             int stationSwapsStart = json.IndexOf("\"stationSwaps\"");
+             if (stationSwapsStart >= 0)
+             {
+                 int braceDepth = 0; bool inArray = false;
+                 var current = new System.Text.StringBuilder();
+                 for (int i = stationSwapsStart; i < json.Length; i++)
+                 {
+                     char c = json[i];
+                     if (c == '[') { inArray = true; continue; }
+                     if (!inArray) continue;
+                     if (c == '{') { braceDepth++; current.Clear(); current.Append(c); }
+                     else if (c == '}' && braceDepth > 0)
+                     {
+                         current.Append(c); braceDepth--;
+                         if (braceDepth == 0)
+                         {
+                             string obj = current.ToString();
+                             string ctype = ExtractString(obj, "componentType");
+                             string idxStr = ExtractString(obj, "stationIndex");
+                             string repl = ExtractString(obj, "replacement");
+                             if (!string.IsNullOrEmpty(ctype) && !string.IsNullOrEmpty(idxStr) && !string.IsNullOrEmpty(repl))
+                             {
+                                 if (int.TryParse(idxStr, out int idx))
+                                     cfg.stationSwaps.Add(new WeaponStationSwapEntry { componentType = ctype, stationIndex = idx, replacement = repl });
+                             }
                          }
                      }
                      else if (braceDepth > 0) current.Append(c);
@@ -294,6 +344,31 @@ namespace LustDaddy
                              catch (Exception ex) { Debug.LogWarning($"[LustDaddy] Failed to apply field mod {fieldMod.fieldName}: {ex.Message}"); }
                          }
                      }
+
+                     // Apply station swaps on the prefab itself, so that instantiated clones get them automatically
+                     foreach (var stationSwap in config.stationSwaps)
+                     {
+                         if (string.IsNullOrEmpty(stationSwap.replacement)) continue;
+                         GameObject newTurretPrefab = null;
+                         if (!TryGetPrefabByPath(stationSwap.replacement, out newTurretPrefab))
+                         {
+                             if (!allGOs.TryGetValue(stationSwap.replacement, out newTurretPrefab)) continue;
+                         }
+
+                         var comps = unitPrefab.GetComponentsInChildren<Component>(true);
+                         Component targetComp = null;
+                         foreach (var c in comps)
+                         {
+                             if (c != null && c.GetType().Name == stationSwap.componentType)
+                             {
+                                 targetComp = c;
+                                 break;
+                             }
+                         }
+                         if (targetComp == null) continue;
+
+                         LustDaddyUI.SwapStationTurretStatic(targetComp, stationSwap.stationIndex, newTurretPrefab);
+                     }
                  }
                  catch (Exception ex) { Debug.LogError($"[LustDaddy] Config error in '{file}': {ex.Message}"); }
              }
@@ -374,13 +449,14 @@ namespace LustDaddy
         private Rect _windowRect = new Rect(100, 100, 800, 650);
         private Vector2 _scrollPosition;
 
-        private enum Tab { Payloads, Turrets, Units }
+        private enum Tab { Payloads, Turrets, Units, Aircraft }
         private Tab _currentTab = Tab.Payloads;
 
         // ── Prefab Caches ────────────────────────────────────────────────────
         private List<Object> _payloadPrefabs         = new List<Object>();
         private List<Object> _turretPrefabs          = new List<Object>(); // WeaponInfo ScriptableObjects (for field editors)
         private List<Object> _unitPrefabs            = new List<Object>();
+        private List<Object> _aircraftPrefabs        = new List<Object>();
         private List<GameObject> _sourceTurretGOs    = new List<GameObject>(); // physical turret prefab GOs (for Turrets tab + cycler)
         private Dictionary<string, GameObject> _allPrefabsCache = new Dictionary<string, GameObject>();
         private bool _scanned = false;
@@ -390,6 +466,7 @@ namespace LustDaddy
         private int _selectedPayloadIndex = -1;
         private int _selectedTurretIndex  = -1; // indexes into _sourceTurretGOs
         private int _selectedUnitIndex    = -1;
+        private int _selectedAircraftIndex = -1;
 
         // ── Component Editor State ───────────────────────────────────────────
         private List<Object> _selectedComponents = new List<Object>();
@@ -433,6 +510,7 @@ namespace LustDaddy
             if (GUILayout.Button("Payloads", _currentTab == Tab.Payloads ? SelectedStyle() : GUI.skin.button)) SwitchTab(Tab.Payloads);
             if (GUILayout.Button("Turrets",  _currentTab == Tab.Turrets  ? SelectedStyle() : GUI.skin.button)) SwitchTab(Tab.Turrets);
             if (GUILayout.Button("Units",    _currentTab == Tab.Units    ? SelectedStyle() : GUI.skin.button)) SwitchTab(Tab.Units);
+            if (GUILayout.Button("Aircraft", _currentTab == Tab.Aircraft ? SelectedStyle() : GUI.skin.button)) SwitchTab(Tab.Aircraft);
             GUILayout.EndHorizontal();
 
             if (GUILayout.Button("Force Rescan")) { ScanPrefabs(); UpdateSelectedObject(); }
@@ -445,6 +523,7 @@ namespace LustDaddy
                 case Tab.Payloads: DrawDropdown(ref _selectedPayloadIndex, _payloadPrefabs); break;
                 case Tab.Turrets:  DrawSourceTurretDropdown(); break;
                 case Tab.Units:    DrawDropdown(ref _selectedUnitIndex,    _unitPrefabs);    break;
+                case Tab.Aircraft: DrawDropdown(ref _selectedAircraftIndex, _aircraftPrefabs); break;
             }
 
             GUILayout.Space(10);
@@ -503,10 +582,12 @@ namespace LustDaddy
                 bool isPayload = go.GetComponent("Missile") != null
                               || go.GetComponent("OpticalSeekerBomb") != null
                               || go.GetComponent("Warhead") != null;
-                bool isUnit = go.transform.parent == null && go.GetComponent("Unit") != null && !isPayload && go.GetComponent("Aircraft") == null;
+                bool isAircraft = go.GetComponent("Aircraft") != null;
+                bool isUnit = go.transform.parent == null && go.GetComponent("Unit") != null && !isPayload && !isAircraft;
 
                 if (isPayload) _payloadPrefabs.Add(go);
                 if (isUnit)    _unitPrefabs.Add(go);
+                if (isAircraft) _aircraftPrefabs.Add(go);
             }
 
             // Extract child turrets from units instead of just root prefabs
@@ -547,6 +628,7 @@ namespace LustDaddy
             _payloadPrefabs.Sort((a, b) => a.name.CompareTo(b.name));
             _turretPrefabs.Sort((a, b) => a.name.CompareTo(b.name));
             _unitPrefabs.Sort((a, b) => a.name.CompareTo(b.name));
+            _aircraftPrefabs.Sort((a, b) => a.name.CompareTo(b.name));
             _sourceTurretGOs.Sort((a, b) => a.name.CompareTo(b.name));
             _scanned = true;
         }
@@ -581,6 +663,8 @@ namespace LustDaddy
                 return _sourceTurretGOs[_selectedTurretIndex];
             if (_currentTab == Tab.Units && _selectedUnitIndex >= 0 && _selectedUnitIndex < _unitPrefabs.Count)
                 return _unitPrefabs[_selectedUnitIndex];
+            if (_currentTab == Tab.Aircraft && _selectedAircraftIndex >= 0 && _selectedAircraftIndex < _aircraftPrefabs.Count)
+                return _aircraftPrefabs[_selectedAircraftIndex];
             return null;
         }
 
@@ -801,9 +885,7 @@ namespace LustDaddy
 
             GUILayout.Label($"Editing: {selected.name}", new GUIStyle(GUI.skin.label) { fontStyle = FontStyle.Bold });
 
-             // ── Units tab: show config-based turret builder at bottom ─────
-             if (_currentTab == Tab.Units)
-                 DrawUnitConfigUI(selected as GameObject);
+             DrawConfigUI(selected as GameObject);
 
             // Snapshot to avoid collection-modified exception
             var snapshot = _selectedComponents.ToList();
@@ -840,34 +922,87 @@ namespace LustDaddy
         #endregion
 
         // ════════════════════════════════════════════════════════════════════
-        #region Unit Turret Config UI
-        private void DrawUnitConfigUI(GameObject unitGO)
+        #region Config UI
+        private void DrawConfigUI(GameObject rootGO)
         {
-            if (unitGO == null) return;
-
-            _unitTurretSlots.RemoveAll(g => g == null);
-            _sourceTurretGOs.RemoveAll(g => g == null);
-            if (_unitTurretSlotIndex >= _unitTurretSlots.Count)
-                _unitTurretSlotIndex = Mathf.Max(0, _unitTurretSlots.Count - 1);
+            if (rootGO == null) return;
 
             GUILayout.Space(10);
-            GUILayout.Label("─── Turret Config (restart to apply) ───",
+            GUILayout.Label("─── Configuration (restart to apply) ───",
                 new GUIStyle(GUI.skin.label) { fontStyle = FontStyle.Bold, normal = { textColor = Color.yellow } });
 
-            string configPath = Path.Combine(LustDaddyStartup.ConfigDirectory, unitGO.name + ".json");
+            string configPath = Path.Combine(LustDaddyStartup.ConfigDirectory, rootGO.name + ".json");
             bool hasConfig = File.Exists(configPath);
             if (hasConfig)
                 GUILayout.Label("  \u2713 Config saved \u2014 restart game to apply",
                     new GUIStyle(GUI.skin.label) { normal = { textColor = Color.green } });
 
-            if (_unitTurretSlots.Count == 0)
+            if (_currentTab == Tab.Units)
             {
-                GUILayout.Label("  No child turrets found on this unit.",
-                    new GUIStyle(GUI.skin.label) { normal = { textColor = Color.grey } });
+                _unitTurretSlots.RemoveAll(g => g == null);
+                _sourceTurretGOs.RemoveAll(g => g == null);
+                if (_unitTurretSlotIndex >= _unitTurretSlots.Count)
+                    _unitTurretSlotIndex = Mathf.Max(0, _unitTurretSlots.Count - 1);
+
+                if (_unitTurretSlots.Count == 0)
+                {
+                    GUILayout.Label("  No child turrets found on this unit.",
+                        new GUIStyle(GUI.skin.label) { normal = { textColor = Color.grey } });
+                }
+                else
+                {
+                    bool isShip = rootGO.GetComponent("Ship") != null;
+                    var validSources = new List<GameObject>();
+                    foreach (var g in _sourceTurretGOs)
+                    {
+                        bool hasShipPart = false;
+                        foreach (var c in g.GetComponentsInChildren<Component>(true)) {
+                            if (c != null && c.GetType().Name == "ShipPart") hasShipPart = true;
+                        }
+                        if (!isShip && hasShipPart) continue;
+                        validSources.Add(g);
+                    }
+
+                    string[] sourceNames = new[] { "(no change)" }
+                        .Concat(validSources.Select(g => GetGameObjectPath(g))).ToArray();
+
+                    GUILayout.Label("  Assign replacements per slot:",
+                        new GUIStyle(GUI.skin.label) { normal = { textColor = Color.grey } });
+
+                    foreach (var slotGO in _unitTurretSlots)
+                    {
+                        if (slotGO == null) continue;
+                        string slotName = slotGO.name;
+                        if (!_unitSlotAssignments.ContainsKey(slotName))
+                            _unitSlotAssignments[slotName] = 0;
+
+                        GUILayout.BeginHorizontal();
+                        GUILayout.Label(slotName, GUILayout.Width(160));
+                        int cur = _unitSlotAssignments[slotName];
+                        _unitSlotAssignments[slotName] = DrawCycler("", cur, sourceNames, 400, Color.cyan);
+                        GUILayout.EndHorizontal();
+                    }
+                }
             }
-            else
+
+            GUILayout.Space(6);
+            if (GUILayout.Button("Save Config (restart to apply)", GUILayout.Height(28)))
+                SaveConfig(rootGO);
+
+            if (hasConfig && GUILayout.Button("Clear Config"))
             {
-                bool isShip = unitGO.GetComponent("Ship") != null;
+                File.Delete(configPath);
+                Debug.Log($"[LustDaddy] Cleared config for '{rootGO.name}'");
+            }
+        }
+
+        private void SaveConfig(GameObject rootGO)
+        {
+            var config = new UnitModConfig { unitId = rootGO.name };
+
+            if (_currentTab == Tab.Units)
+            {
+                bool isShip = rootGO.GetComponent("Ship") != null;
                 var validSources = new List<GameObject>();
                 foreach (var g in _sourceTurretGOs)
                 {
@@ -879,64 +1014,51 @@ namespace LustDaddy
                     validSources.Add(g);
                 }
 
-                string[] sourceNames = new[] { "(no change)" }
-                    .Concat(validSources.Select(g => GetGameObjectPath(g))).ToArray();
-
-                GUILayout.Label("  Assign replacements per slot:",
-                    new GUIStyle(GUI.skin.label) { normal = { textColor = Color.grey } });
-
-                foreach (var slotGO in _unitTurretSlots)
+                foreach (var kv in _unitSlotAssignments)
                 {
-                    if (slotGO == null) continue;
-                    string slotName = slotGO.name;
-                    if (!_unitSlotAssignments.ContainsKey(slotName))
-                        _unitSlotAssignments[slotName] = 0;
-
-                    GUILayout.BeginHorizontal();
-                    GUILayout.Label(slotName, GUILayout.Width(160));
-                    int cur = _unitSlotAssignments[slotName];
-                    _unitSlotAssignments[slotName] = DrawCycler("", cur, sourceNames, 400, Color.cyan);
-                    GUILayout.EndHorizontal();
+                    if (kv.Value <= 0) continue;
+                    int srcIdx = kv.Value - 1;
+                    if (srcIdx >= validSources.Count) continue;
+                    config.turretSwaps.Add(new TurretSwapEntry
+                    {
+                        slotName    = kv.Key,
+                        replacement = GetGameObjectPath(validSources[srcIdx])
+                    });
                 }
             }
 
-            GUILayout.Space(6);
-            if (GUILayout.Button("Save Config (restart to apply)", GUILayout.Height(28)))
-                SaveUnitConfig(unitGO);
-
-            if (hasConfig && GUILayout.Button("Clear Config"))
+            // Save weapon station modifications
+            if (_currentTab == Tab.Turrets)
             {
-                File.Delete(configPath);
-                Debug.Log($"[LustDaddy] Cleared config for '{unitGO.name}'");
-            }
-        }
-
-        private void SaveUnitConfig(GameObject unitGO)
-        {
-            var config = new UnitModConfig { unitId = unitGO.name };
-
-            bool isShip = unitGO.GetComponent("Ship") != null;
-            var validSources = new List<GameObject>();
-            foreach (var g in _sourceTurretGOs)
-            {
-                bool hasShipPart = false;
-                foreach (var c in g.GetComponentsInChildren<Component>(true)) {
-                    if (c != null && c.GetType().Name == "ShipPart") hasShipPart = true;
-                }
-                if (!isShip && hasShipPart) continue;
-                validSources.Add(g);
-            }
-
-            foreach (var kv in _unitSlotAssignments)
-            {
-                if (kv.Value <= 0) continue;
-                int srcIdx = kv.Value - 1;
-                if (srcIdx >= validSources.Count) continue;
-                config.turretSwaps.Add(new TurretSwapEntry
+                // Find weapon station holders and their swapped indices
+                var validSources = _sourceTurretGOs;
+                int stationUiIndex = 0;
+                foreach (var comp in _selectedComponents)
                 {
-                    slotName    = kv.Key,
-                    replacement = GetGameObjectPath(validSources[srcIdx])
-                });
+                    var wsField = GetFieldRecursively(comp.GetType(), "weaponStations");
+                    if (wsField == null) continue;
+                    var stations = wsField.GetValue(comp) as System.Collections.IList;
+                    if (stations == null) continue;
+                    string compName = comp.GetType().Name;
+                    
+                    for (int i = 0; i < stations.Count; i++)
+                    {
+                        if (_stationSwapIndices.ContainsKey(stationUiIndex))
+                        {
+                            int newIdx = _stationSwapIndices[stationUiIndex];
+                            if (newIdx >= 0 && newIdx < validSources.Count)
+                            {
+                                config.stationSwaps.Add(new WeaponStationSwapEntry
+                                {
+                                    componentType = compName,
+                                    stationIndex = i,
+                                    replacement = GetGameObjectPath(validSources[newIdx])
+                                });
+                            }
+                        }
+                        stationUiIndex++;
+                    }
+                }
             }
 
             // Save field modifications
@@ -964,11 +1086,11 @@ namespace LustDaddy
                 }
             }
 
-            if (config.turretSwaps.Count == 0 && config.fieldMods.Count == 0) { Debug.Log("[LustDaddy] Nothing to save."); return; }
+            if (config.turretSwaps.Count == 0 && config.fieldMods.Count == 0 && config.stationSwaps.Count == 0) { Debug.Log("[LustDaddy] Nothing to save."); return; }
             Directory.CreateDirectory(LustDaddyStartup.ConfigDirectory);
             string json = config.ToJson();
-            File.WriteAllText(Path.Combine(LustDaddyStartup.ConfigDirectory, unitGO.name + ".json"), json);
-            Debug.Log($"[LustDaddy] Config saved for '{unitGO.name}':\n{json}");
+            File.WriteAllText(Path.Combine(LustDaddyStartup.ConfigDirectory, rootGO.name + ".json"), json);
+            Debug.Log($"[LustDaddy] Config saved for '{rootGO.name}':\n{json}");
         }
         #endregion
 
@@ -990,23 +1112,33 @@ namespace LustDaddy
 
             string[] prefabNames = _sourceTurretGOs.Select(t => t.name).ToArray();
 
+            // We need a global index into _stationSwapIndices because DrawWeaponStations is called per-component
+            // but the dictionary is shared. Alternatively, re-initialize it based on the current physical turret.
+            int stationUiIndex = 0; // We must find out where this component's stations start in the UI
+            foreach(var c in _selectedComponents)
+            {
+                if (c == comp) break;
+                var cwf = GetFieldRecursively(c.GetType(), "weaponStations");
+                if (cwf != null && cwf.GetValue(c) is System.Collections.IList cl) stationUiIndex += cl.Count;
+            }
+
             for (int i = 0; i < stations.Count; i++)
             {
                 var station = stations[i];
-                if (station == null) continue;
+                if (station == null) { stationUiIndex++; continue; }
 
                 string currentPhysical = GetPhysicalTurretName(station);
 
-                if (!_stationSwapIndices.ContainsKey(i))
+                if (!_stationSwapIndices.ContainsKey(stationUiIndex))
                 {
                     int matchIdx = _sourceTurretGOs.FindIndex(t => t.name == currentPhysical);
-                    _stationSwapIndices[i] = matchIdx >= 0 ? matchIdx : 0;
+                    _stationSwapIndices[stationUiIndex] = matchIdx >= 0 ? matchIdx : 0;
                 }
 
                 GUILayout.Space(4);
-                int oldIdx = _stationSwapIndices[i];
+                int oldIdx = _stationSwapIndices[stationUiIndex];
                 int newIdx = DrawCycler($"Station {i} Turret:", oldIdx, prefabNames, 200, Color.cyan);
-                _stationSwapIndices[i] = newIdx;
+                _stationSwapIndices[stationUiIndex] = newIdx;
 
                 if (newIdx != oldIdx && prefabNames.Length > 0)
                     SwapStationTurret(comp as Component, i, _sourceTurretGOs[newIdx]);
@@ -1065,25 +1197,20 @@ namespace LustDaddy
             return index;
         }
 
-        /// <summary>
-        /// Swaps the physical turret on the given station.
-        /// stationHolder = any Component that has a "weaponStations" field.
-        /// </summary>
-        private void SwapStationTurret(Component stationHolder, int stationIndex, GameObject newTurretPrefab)
+        public static void SwapStationTurretStatic(Component stationHolder, int stationIndex, GameObject newTurretPrefab)
         {
             if (stationHolder == null || newTurretPrefab == null) return;
 
-            var wsField = GetFieldRecursively(stationHolder.GetType(), "weaponStations");
+            var wsField = GetFieldRecursivelyStatic(stationHolder.GetType(), "weaponStations");
             if (wsField == null) return;
             var stations = wsField.GetValue(stationHolder) as System.Collections.IList;
             if (stations == null || stationIndex >= stations.Count) return;
             var station = stations[stationIndex];
             if (station == null) return;
 
-            // 1. Locate old physical GO
             GameObject oldGO = null;
-            var tList = GetMemberValue(station, "Turrets") as System.Collections.IList;
-            var wList = GetMemberValue(station, "Weapons") as System.Collections.IList;
+            var tList = GetMemberValueStatic(station, "Turrets") as System.Collections.IList;
+            var wList = GetMemberValueStatic(station, "Weapons") as System.Collections.IList;
 
             if (tList != null && tList.Count > 0 && tList[0] is Component tComp && tComp != null)
                 oldGO = tComp.gameObject;
@@ -1094,13 +1221,8 @@ namespace LustDaddy
                 oldGO = pt != null ? pt.gameObject : wComp.gameObject;
             }
 
-            if (oldGO == null)
-            {
-                Debug.LogError($"[LustDaddy] SwapStationTurret: no existing turret GO on station {stationIndex} of '{stationHolder.gameObject.name}'");
-                return;
-            }
+            if (oldGO == null) return;
 
-            // 2. Clone new turret at same transform
             Transform parent = oldGO.transform.parent;
             GameObject newGO = GameObject.Instantiate(newTurretPrefab, parent);
             newGO.name = newTurretPrefab.name;
@@ -1108,39 +1230,46 @@ namespace LustDaddy
             newGO.transform.localRotation = oldGO.transform.localRotation;
             newGO.transform.localScale    = oldGO.transform.localScale;
 
-            // 3. Wire unit refs (best-effort — doesn't block the swap if not found)
-            Component unitComp = TryFindUnit(stationHolder);
-            if (unitComp != null) SetTurretUnitReferences(newGO, unitComp);
+            // Wire unit refs
+            Component unitComp = TryFindUnitStatic(stationHolder);
+            if (unitComp != null) SetTurretUnitReferencesStatic(newGO, unitComp);
 
-            // 4. Collect new sub-components
-            var newTurrets = GetComponentsByName(newGO, "Turret");
-            var newGuns    = GetComponentsByName(newGO, "Gun");
-            var newLaunch  = GetComponentsByName(newGO, "MissileLauncher");
+            var newTurrets = GetComponentsByNameStatic(newGO, "Turret");
+            var newGuns    = GetComponentsByNameStatic(newGO, "Gun");
+            var newLaunch  = GetComponentsByNameStatic(newGO, "MissileLauncher");
             var newWeapons = newGuns.Concat(newLaunch).ToList();
 
-            // 5. Update station collections
-            ReplaceCollection(station, "Turrets", newTurrets);
-            ReplaceCollection(station, "Weapons", newWeapons);
+            ReplaceCollectionStatic(station, "Turrets", newTurrets);
+            ReplaceCollectionStatic(station, "Weapons", newWeapons);
 
-            // 6. Auto-extract WeaponInfo
             Object newWi = null;
-            foreach (var wc in newWeapons) { newWi = GetMemberValue(wc, "WeaponInfo") as Object; if (newWi != null) break; }
+            foreach (var wc in newWeapons) { newWi = GetMemberValueStatic(wc, "WeaponInfo") as Object; if (newWi != null) break; }
             if (newWi == null)
-                foreach (var tc in newTurrets) { newWi = GetMemberValue(tc, "WeaponInfo") as Object; if (newWi != null) break; }
+                foreach (var tc in newTurrets) { newWi = GetMemberValueStatic(tc, "WeaponInfo") as Object; if (newWi != null) break; }
 
-            SetMemberValue(station, "WeaponInfo", newWi);
+            SetMemberValueStatic(station, "WeaponInfo", newWi);
             foreach (var wc in newWeapons.Concat(newTurrets))
             {
-                if (GetFieldRecursively(wc.GetType(), "WeaponInfo") != null || GetPropertyRecursively(wc.GetType(), "WeaponInfo") != null)
-                    SetMemberValue(wc, "WeaponInfo", newWi);
+                if (GetFieldRecursivelyStatic(wc.GetType(), "WeaponInfo") != null || GetPropertyRecursivelyStatic(wc.GetType(), "WeaponInfo") != null)
+                    SetMemberValueStatic(wc, "WeaponInfo", newWi);
             }
 
-            // 7. Apply same swap to all matching scene instances
+            GameObject.DestroyImmediate(oldGO, true);
+        }
+
+        private void SwapStationTurret(Component stationHolder, int stationIndex, GameObject newTurretPrefab)
+        {
+            if (stationHolder == null || newTurretPrefab == null) return;
+            SwapStationTurretStatic(stationHolder, stationIndex, newTurretPrefab);
+            
+            // Re-fetch the newly modified station info to print the log correctly
+            var wsField = GetFieldRecursivelyStatic(stationHolder.GetType(), "weaponStations");
+            var stations = wsField?.GetValue(stationHolder) as System.Collections.IList;
+            var station = stations != null && stationIndex < stations.Count ? stations[stationIndex] : null;
+            Object newWi = station != null ? GetMemberValueStatic(station, "WeaponInfo") as Object : null;
+            
             ApplySwapToInstances(stationHolder, stationIndex, newTurretPrefab);
-
-            // 8. Destroy old turret GO // could be destroying the new turret too, so to be safe, i disable it
-            // GameObject.Destroy(oldGO);
-
+            
             _needsRefreshSelected = true;
             Debug.Log($"[LustDaddy] Swapped station {stationIndex} on '{stationHolder.gameObject.name}' -> '{newTurretPrefab.name}' (WI: {(newWi != null ? newWi.name : "None")})");
         }
@@ -1209,7 +1338,7 @@ namespace LustDaddy
 
         // ════════════════════════════════════════════════════════════════════
         #region Reflection Helpers
-        private FieldInfo GetFieldRecursively(Type type, string fieldName)
+        private static FieldInfo GetFieldRecursivelyStatic(Type type, string fieldName)
         {
             string lower = char.ToLower(fieldName[0]) + fieldName.Substring(1);
             while (type != null && type != typeof(object))
@@ -1227,8 +1356,10 @@ namespace LustDaddy
             }
             return null;
         }
+        
+        private FieldInfo GetFieldRecursively(Type type, string fieldName) => GetFieldRecursivelyStatic(type, fieldName);
 
-        private PropertyInfo GetPropertyRecursively(Type type, string propName)
+        private static PropertyInfo GetPropertyRecursivelyStatic(Type type, string propName)
         {
             string lower = char.ToLower(propName[0]) + propName.Substring(1);
             while (type != null && type != typeof(object))
@@ -1246,25 +1377,31 @@ namespace LustDaddy
             }
             return null;
         }
+        
+        private PropertyInfo GetPropertyRecursively(Type type, string propName) => GetPropertyRecursivelyStatic(type, propName);
 
-        private object GetMemberValue(object obj, string name)
+        private static object GetMemberValueStatic(object obj, string name)
         {
-            var f = GetFieldRecursively(obj.GetType(), name);
+            var f = GetFieldRecursivelyStatic(obj.GetType(), name);
             if (f != null) return f.GetValue(obj);
-            var p = GetPropertyRecursively(obj.GetType(), name);
+            var p = GetPropertyRecursivelyStatic(obj.GetType(), name);
             if (p != null && p.CanRead) return p.GetValue(obj);
             return null;
         }
 
-        private void SetMemberValue(object obj, string name, object value)
+        private object GetMemberValue(object obj, string name) => GetMemberValueStatic(obj, name);
+
+        private static void SetMemberValueStatic(object obj, string name, object value)
         {
-            var f = GetFieldRecursively(obj.GetType(), name);
+            var f = GetFieldRecursivelyStatic(obj.GetType(), name);
             if (f != null) { f.SetValue(obj, value); return; }
-            var p = GetPropertyRecursively(obj.GetType(), name);
+            var p = GetPropertyRecursivelyStatic(obj.GetType(), name);
             if (p != null && p.CanWrite) p.SetValue(obj, value);
         }
 
-        private List<Component> GetComponentsByName(GameObject go, string typeName)
+        private void SetMemberValue(object obj, string name, object value) => SetMemberValueStatic(obj, name, value);
+
+        private static List<Component> GetComponentsByNameStatic(GameObject go, string typeName)
         {
             var list = new List<Component>();
             foreach (var c in go.GetComponentsInChildren<Component>(true))
@@ -1280,9 +1417,11 @@ namespace LustDaddy
             return list;
         }
 
-        private void ReplaceCollection(object parent, string fieldName, List<Component> newItems)
+        private List<Component> GetComponentsByName(GameObject go, string typeName) => GetComponentsByNameStatic(go, typeName);
+
+        private static void ReplaceCollectionStatic(object parent, string fieldName, List<Component> newItems)
         {
-            var f = GetFieldRecursively(parent.GetType(), fieldName);
+            var f = GetFieldRecursivelyStatic(parent.GetType(), fieldName);
             if (f == null) return;
             var ft = f.FieldType;
             if (ft.IsArray)
@@ -1310,6 +1449,8 @@ namespace LustDaddy
                 }
             }
         }
+        
+        private void ReplaceCollection(object parent, string fieldName, List<Component> newItems) => ReplaceCollectionStatic(parent, fieldName, newItems);
         #endregion
 
         // ════════════════════════════════════════════════════════════════════
@@ -1495,13 +1636,13 @@ namespace LustDaddy
 
         // ════════════════════════════════════════════════════════════════════
         #region Turret Wiring
-        private bool IsTypeOrSubclass(Type type, string name)
+        private static bool IsTypeOrSubclassStatic(Type type, string name)
         {
             while (type != null && type != typeof(object)) { if (type.Name == name) return true; type = type.BaseType; }
             return false;
         }
 
-        private void SetTurretUnitReferences(GameObject turretGO, Component parentUnit)
+        private static void SetTurretUnitReferencesStatic(GameObject turretGO, Component parentUnit)
         {
             if (parentUnit == null) return;
             Rigidbody rb = parentUnit.GetComponent<Rigidbody>();
@@ -1509,15 +1650,31 @@ namespace LustDaddy
             {
                 if (part == null) continue;
                 var type = part.GetType();
-                if (IsTypeOrSubclass(type, "UnitPart"))
-                    SetMemberValue(part, "parentUnit", parentUnit);
-                else if (IsTypeOrSubclass(type, "Turret") || IsTypeOrSubclass(type, "TargetDetector") ||
-                         IsTypeOrSubclass(type, "MissileLauncher") || IsTypeOrSubclass(type, "RadarJammer") ||
-                         IsTypeOrSubclass(type, "WeaponStation"))
-                    SetMemberValue(part, "attachedUnit", parentUnit);
-                else if (IsTypeOrSubclass(type, "Gun") && rb != null)
-                    SetMemberValue(part, "velocityInherit", rb);
+                if (IsTypeOrSubclassStatic(type, "UnitPart"))
+                    SetMemberValueStatic(part, "parentUnit", parentUnit);
+                else if (IsTypeOrSubclassStatic(type, "Turret") || IsTypeOrSubclassStatic(type, "TargetDetector") ||
+                         IsTypeOrSubclassStatic(type, "MissileLauncher") || IsTypeOrSubclassStatic(type, "RadarJammer") ||
+                         IsTypeOrSubclassStatic(type, "WeaponStation"))
+                    SetMemberValueStatic(part, "attachedUnit", parentUnit);
+                else if (IsTypeOrSubclassStatic(type, "Gun") && rb != null)
+                    SetMemberValueStatic(part, "velocityInherit", rb);
             }
+        }
+        
+        private static Component TryFindUnitStatic(Component comp)
+        {
+            if (comp == null) return null;
+            Type unitType = Type.GetType("Unit, Assembly-CSharp");
+            if (unitType == null) return null;
+
+            Transform t = comp.transform;
+            while (t != null)
+            {
+                var c = t.GetComponent(unitType);
+                if (c != null) return c as Component;
+                t = t.parent;
+            }
+            return null;
         }
         #endregion
     }
