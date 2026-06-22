@@ -1,14 +1,14 @@
 using System;
- using System.Collections.Generic;
- using System.IO;
- using System.Linq;
- using System.Reflection;
- using System.Text.RegularExpressions;
- using BepInEx;
- using BepInEx.Configuration;
- using HarmonyLib;
- using UnityEngine;
- using Object = UnityEngine.Object;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text.RegularExpressions;
+using BepInEx;
+using BepInEx.Configuration;
+using HarmonyLib;
+using UnityEngine;
+using Object = UnityEngine.Object;
 
 namespace LustDaddy
 {
@@ -37,51 +37,70 @@ namespace LustDaddy
                     object rootVal = RootField.GetValue(comp);
                     if (rootVal == null) return;
                     SubField.SetValue(rootVal, value);
-                    RootField.SetValue(comp, rootVal); 
+                    RootField.SetValue(comp, rootVal);
                 }
             }
         }
 
-        // ── Window ──────────────────────────────────────────────────────────
         private bool _showWindow = false;
         private Rect _windowRect = new Rect(100, 100, 800, 650);
         private Vector2 _scrollPosition;
 
-        private enum Tab { Payloads, Turrets, Units, Aircraft }
+        private enum Tab { Payloads, Turrets, Units, Aircraft, Hardpoints }
         private Tab _currentTab = Tab.Payloads;
 
-        // ── Prefab Caches ────────────────────────────────────────────────────
+        private enum GuiMode { Lite, Full }
+        private GuiMode _guiMode = GuiMode.Lite;
+
+        private static readonly string[] LiteFieldNames = { "ammo", "maxammo", "fuellevel", "hitpoints", "hp", "rcs" };
+
+        private static bool IsLiteField(string fieldName)
+        {
+            string lower = fieldName.ToLowerInvariant();
+            if (Array.IndexOf(LiteFieldNames, lower) >= 0) return true;
+            return lower.EndsWith("capacity") || lower.EndsWith("count");
+        }
+
         private List<Object> _payloadPrefabs         = new List<Object>();
-        private List<Object> _turretPrefabs          = new List<Object>(); // WeaponInfo ScriptableObjects (for field editors)
+        private List<Object> _turretPrefabs          = new List<Object>();
         private List<Object> _unitPrefabs            = new List<Object>();
         private List<Object> _aircraftPrefabs        = new List<Object>();
-        private List<GameObject> _sourceTurretGOs    = new List<GameObject>(); // physical turret prefab GOs (for Turrets tab + cycler)
+        private List<Object> _hardpointPrefabs       = new List<Object>();
+        private List<GameObject> _sourceTurretGOs    = new List<GameObject>();
         private Dictionary<string, GameObject> _allPrefabsCache = new Dictionary<string, GameObject>();
         private bool _scanned = false;
         private GameObject _actualNukePrefab = null;
 
-        // ── Selection ────────────────────────────────────────────────────────
         private int _selectedPayloadIndex = -1;
-        private int _selectedTurretIndex  = -1; // indexes into _sourceTurretGOs
+        private int _selectedTurretIndex  = -1;
         private int _selectedUnitIndex    = -1;
         private int _selectedAircraftIndex = -1;
+        private int _selectedHardpointIndex = -1;
 
-        // ── Component Editor State ───────────────────────────────────────────
+        private string _payloadSearch = "";
+        private string _turretListSearch = "";
+        private string _unitSearch = "";
+        private string _aircraftSearch = "";
+        private string _hardpointSearch = "";
+        private Dictionary<string, string> _unitSlotSearch = new Dictionary<string, string>();
+        private Dictionary<string, string> _stationSwapSearch = new Dictionary<string, string>();
+
         private List<Object> _selectedComponents = new List<Object>();
         private Dictionary<Object, List<CustomField>> _editableFields = new Dictionary<Object, List<CustomField>>();
         private Dictionary<Object, Dictionary<string, object>> _originalValues = new Dictionary<Object, Dictionary<string, object>>();
         private bool _needsRefreshSelected = false;
 
-        // ── Per-station cycler (Turrets tab): key = stationIndex, value = _sourceTurretGOs index ──
         private Dictionary<int, int> _stationSwapIndices = new Dictionary<int, int>();
 
-        // ── Unit Turret Cycler (Units tab): swap entire child turret GO ──────
-        private List<GameObject> _unitTurretSlots = new List<GameObject>(); // child turret GOs on selected unit
-        private int _unitTurretSlotIndex  = 0; // which slot (child turret) the user is targeting
-        private int _unitTurretSwapIndex  = 0; // which source turret GO to swap in
+        private List<GameObject> _unitTurretSlots = new List<GameObject>();
+        private int _unitTurretSlotIndex  = 0;
+        private int _unitTurretSwapIndex  = 0;
         private Dictionary<string, int> _unitSlotAssignments = new Dictionary<string, int>();
 
-        // ════════════════════════════════════════════════════════════════════
+        private Dictionary<string, string> _pendingPass = new Dictionary<string, string>();
+        private Dictionary<string, string> _pendingNeeds = new Dictionary<string, string>();
+        private Dictionary<string, string> _pendingNewUnitId = new Dictionary<string, string>();
+
         #region Unity Lifecycle
         private void Update()
         {
@@ -100,7 +119,6 @@ namespace LustDaddy
         }
         #endregion
 
-        // ════════════════════════════════════════════════════════════════════
         #region Window
         private void WindowFunction(int windowID)
         {
@@ -109,24 +127,33 @@ namespace LustDaddy
             if (GUILayout.Button("Turrets",  _currentTab == Tab.Turrets  ? SelectedStyle() : GUI.skin.button)) SwitchTab(Tab.Turrets);
             if (GUILayout.Button("Units",    _currentTab == Tab.Units    ? SelectedStyle() : GUI.skin.button)) SwitchTab(Tab.Units);
             if (GUILayout.Button("Aircraft", _currentTab == Tab.Aircraft ? SelectedStyle() : GUI.skin.button)) SwitchTab(Tab.Aircraft);
+            if (GUILayout.Button("Hardpoints", _currentTab == Tab.Hardpoints ? SelectedStyle() : GUI.skin.button)) SwitchTab(Tab.Hardpoints);
             GUILayout.EndHorizontal();
 
+            GUILayout.BeginHorizontal();
             if (GUILayout.Button("Force Rescan")) { ScanPrefabs(); UpdateSelectedObject(); }
+            string modeLabel = _guiMode == GuiMode.Lite ? "Mode: Lite (simple stats)" : "Mode: Full (all fields)";
+            if (GUILayout.Button(modeLabel, GUILayout.Width(220)))
+            {
+                _guiMode = _guiMode == GuiMode.Lite ? GuiMode.Full : GuiMode.Lite;
+                UpdateSelectedObject();
+            }
+            GUILayout.EndHorizontal();
             GUILayout.Space(10);
 
             _scrollPosition = GUILayout.BeginScrollView(_scrollPosition);
 
             switch (_currentTab)
             {
-                case Tab.Payloads: DrawDropdown(ref _selectedPayloadIndex, _payloadPrefabs); break;
+                case Tab.Payloads: DrawDropdown(ref _selectedPayloadIndex, _payloadPrefabs, ref _payloadSearch); break;
                 case Tab.Turrets:  DrawSourceTurretDropdown(); break;
-                case Tab.Units:    DrawDropdown(ref _selectedUnitIndex,    _unitPrefabs);    break;
-                case Tab.Aircraft: DrawDropdown(ref _selectedAircraftIndex, _aircraftPrefabs); break;
+                case Tab.Units:    DrawDropdown(ref _selectedUnitIndex,    _unitPrefabs, ref _unitSearch);    break;
+                case Tab.Aircraft: DrawDropdown(ref _selectedAircraftIndex, _aircraftPrefabs, ref _aircraftSearch); break;
+                case Tab.Hardpoints: DrawDropdown(ref _selectedHardpointIndex, _hardpointPrefabs, ref _hardpointSearch); break;
             }
 
             GUILayout.Space(10);
 
-            // Flush any pending refresh BEFORE drawing so lists are clean
             if (_needsRefreshSelected)
             {
                 _needsRefreshSelected = false;
@@ -157,13 +184,14 @@ namespace LustDaddy
         }
         #endregion
 
-        // ════════════════════════════════════════════════════════════════════
         #region Scanning
         private void ScanPrefabs()
         {
             _payloadPrefabs.Clear();
             _turretPrefabs.Clear();
             _unitPrefabs.Clear();
+            _aircraftPrefabs.Clear();
+            _hardpointPrefabs.Clear();
             _sourceTurretGOs.Clear();
             _allPrefabsCache.Clear();
 
@@ -186,9 +214,11 @@ namespace LustDaddy
                 if (isPayload) _payloadPrefabs.Add(go);
                 if (isUnit)    _unitPrefabs.Add(go);
                 if (isAircraft) _aircraftPrefabs.Add(go);
+
+                if (!isPayload && !isAircraft && !isUnit && IsHardpointEquipmentName(go.name))
+                    _hardpointPrefabs.Add(go);
             }
 
-            // Extract child turrets from units instead of just root prefabs
             foreach (var unit in _unitPrefabs)
             {
                 foreach (var comp in ((GameObject)unit).GetComponentsInChildren<Component>(true))
@@ -214,7 +244,6 @@ namespace LustDaddy
                 }
             }
 
-            // WeaponInfo objects — kept for field editors that reference WeaponInfo
             Type wiType = Type.GetType("WeaponInfo, Assembly-CSharp");
             if (wiType != null)
                 foreach (var w in Resources.FindObjectsOfTypeAll(wiType))
@@ -227,54 +256,86 @@ namespace LustDaddy
             _turretPrefabs.Sort((a, b) => a.name.CompareTo(b.name));
             _unitPrefabs.Sort((a, b) => a.name.CompareTo(b.name));
             _aircraftPrefabs.Sort((a, b) => a.name.CompareTo(b.name));
+            _hardpointPrefabs.Sort((a, b) => a.name.CompareTo(b.name));
             _sourceTurretGOs.Sort((a, b) => a.name.CompareTo(b.name));
             _scanned = true;
         }
+
+        private static readonly string[] HardpointEquipmentNamePatterns =
+            { "radome", "pod", "jammer", "flare", "chaff", "ecm" };
+
+        private static bool IsHardpointEquipmentName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            string lower = name.ToLowerInvariant();
+            foreach (var pattern in HardpointEquipmentNamePatterns)
+                if (lower.Contains(pattern)) return true;
+            return false;
+        }
         #endregion
 
-        // ════════════════════════════════════════════════════════════════════
         #region Turrets Tab Dropdown
-        /// <summary>Turrets tab shows physical turret GOs, not WeaponInfo objects.</summary>
         private void DrawSourceTurretDropdown()
         {
             if (_sourceTurretGOs.Count == 0) { GUILayout.Label("No turret prefabs found."); return; }
             GUILayout.Label("Select Physical Turret Prefab:");
-            string[] names = _sourceTurretGOs.Select(g => GetGameObjectPath(g)).ToArray();
-            int newIndex = GUILayout.SelectionGrid(_selectedTurretIndex, names, 1);
-            if (newIndex != _selectedTurretIndex)
+            _turretListSearch = GUILayout.TextField(_turretListSearch);
+
+            var filtered = new List<(string name, int origIndex)>();
+            for (int i = 0; i < _sourceTurretGOs.Count; i++)
             {
-                _selectedTurretIndex = newIndex;
+                string path = GetGameObjectPath(_sourceTurretGOs[i]);
+                if (string.IsNullOrEmpty(_turretListSearch) || path.IndexOf(_turretListSearch, StringComparison.OrdinalIgnoreCase) >= 0)
+                    filtered.Add((path, i));
+            }
+
+            int filteredSelected = filtered.FindIndex(f => f.origIndex == _selectedTurretIndex);
+            int newFilteredIndex = GUILayout.SelectionGrid(filteredSelected, filtered.Select(f => f.name).ToArray(), 1);
+            if (newFilteredIndex != filteredSelected && newFilteredIndex >= 0 && newFilteredIndex < filtered.Count)
+            {
+                _selectedTurretIndex = filtered[newFilteredIndex].origIndex;
                 _stationSwapIndices.Clear();
                 UpdateSelectedObject();
             }
         }
         #endregion
 
-        // ════════════════════════════════════════════════════════════════════
         #region Selection & Dropdown
         private Object GetCurrentSelectedObject()
         {
             if (_currentTab == Tab.Payloads && _selectedPayloadIndex >= 0 && _selectedPayloadIndex < _payloadPrefabs.Count)
                 return _payloadPrefabs[_selectedPayloadIndex];
-            // Turrets tab now uses _sourceTurretGOs
             if (_currentTab == Tab.Turrets && _selectedTurretIndex >= 0 && _selectedTurretIndex < _sourceTurretGOs.Count)
                 return _sourceTurretGOs[_selectedTurretIndex];
             if (_currentTab == Tab.Units && _selectedUnitIndex >= 0 && _selectedUnitIndex < _unitPrefabs.Count)
                 return _unitPrefabs[_selectedUnitIndex];
             if (_currentTab == Tab.Aircraft && _selectedAircraftIndex >= 0 && _selectedAircraftIndex < _aircraftPrefabs.Count)
                 return _aircraftPrefabs[_selectedAircraftIndex];
+            if (_currentTab == Tab.Hardpoints && _selectedHardpointIndex >= 0 && _selectedHardpointIndex < _hardpointPrefabs.Count)
+                return _hardpointPrefabs[_selectedHardpointIndex];
             return null;
         }
 
-        private void DrawDropdown(ref int selectedIndex, List<Object> list)
+        private void DrawDropdown(ref int selectedIndex, List<Object> list, ref string searchFilter)
         {
             if (list.Count == 0) { GUILayout.Label("No items found in this category."); return; }
             GUILayout.Label("Select Entity:");
-            string[] names = list.Select(GetPrefabDisplayName).ToArray();
-            int newIndex = GUILayout.SelectionGrid(selectedIndex, names, 1);
-            if (newIndex != selectedIndex)
+            searchFilter = GUILayout.TextField(searchFilter ?? "");
+
+            var filtered = new List<(string name, int origIndex)>();
+            for (int i = 0; i < list.Count; i++)
             {
-                selectedIndex = newIndex;
+                string display = GetPrefabDisplayName(list[i]);
+                if (string.IsNullOrEmpty(searchFilter) || display.IndexOf(searchFilter, StringComparison.OrdinalIgnoreCase) >= 0)
+                    filtered.Add((display, i));
+            }
+
+            int currentSelectedIndex = selectedIndex;
+            int filteredSelected = filtered.FindIndex(f => f.origIndex == currentSelectedIndex);
+            int newFilteredIndex = GUILayout.SelectionGrid(filteredSelected, filtered.Select(f => f.name).ToArray(), 1);
+            if (newFilteredIndex != filteredSelected && newFilteredIndex >= 0 && newFilteredIndex < filtered.Count)
+            {
+                selectedIndex = filtered[newFilteredIndex].origIndex;
                 _stationSwapIndices.Clear();
                 UpdateSelectedObject();
             }
@@ -341,7 +402,6 @@ namespace LustDaddy
 
             if (!(selected is GameObject go)) return;
 
-            // Root components first, then relevant child components
             var all = go.GetComponents<Component>().ToList();
             foreach (var c in go.GetComponentsInChildren<Component>(true))
             {
@@ -365,13 +425,12 @@ namespace LustDaddy
                 }
             }
 
-            // For Units tab: discover child turret slot GOs
             if (_currentTab == Tab.Units)
             {
                 Type turretType = Type.GetType("Turret, Assembly-CSharp");
                 Type gunType = Type.GetType("Gun, Assembly-CSharp");
                 Type launcherType = Type.GetType("MissileLauncher, Assembly-CSharp");
-                
+
                 var seen = new HashSet<GameObject>();
                 var comps = new List<Component>();
                 if (turretType != null) comps.AddRange(go.GetComponentsInChildren(turretType, true));
@@ -382,7 +441,7 @@ namespace LustDaddy
                 {
                     if (c == null) continue;
                     var slotGO = c.gameObject;
-                    
+
                     bool hasTurretParent = false;
                     Transform p = slotGO.transform.parent;
                     while (p != null)
@@ -395,8 +454,6 @@ namespace LustDaddy
                     if (seen.Add(slotGO)) _unitTurretSlots.Add(slotGO);
                 }
 
-                    // Fallback: search live scene instances if the prefab has no turrets
-                    // (can happen after a swap destroys the prefab's original turret GO)
                     if (_unitTurretSlots.Count == 0)
                     {
                         Type unitType = Type.GetType("Unit, Assembly-CSharp");
@@ -412,15 +469,13 @@ namespace LustDaddy
                                     var slotGO = ((Component)c).gameObject;
                                     if (seen.Add(slotGO)) _unitTurretSlots.Add(slotGO);
                                 }
-                                break; // one live instance is enough
+                                break;
                             }
                         }
                     }
-                // Fallback: any GO with Gun or MissileLauncher directly attached
                 if (_unitTurretSlots.Count == 0)
                 {
                     var seen2 = new HashSet<GameObject>();
-                    // Try prefab first, then live instances
                     IEnumerable<Component> searchComps = go.GetComponentsInChildren<Component>(true);
                     Type unitType2 = Type.GetType("Unit, Assembly-CSharp");
                     if (unitType2 != null)
@@ -477,6 +532,8 @@ namespace LustDaddy
                     }
                 }
             }
+            if (_guiMode == GuiMode.Lite)
+                result = result.Where(f => IsLiteField(f.SubField != null ? f.SubField.Name : f.Name)).ToList();
             return result;
         }
 
@@ -494,7 +551,6 @@ namespace LustDaddy
             t == typeof(Vector3) || t.IsEnum || typeof(Object).IsAssignableFrom(t);
         #endregion
 
-        // ════════════════════════════════════════════════════════════════════
         #region Component Editors
         private void DrawComponentEditors()
         {
@@ -505,7 +561,6 @@ namespace LustDaddy
 
              DrawConfigUI(selected as GameObject);
 
-            // Snapshot to avoid collection-modified exception
             var snapshot = _selectedComponents.ToList();
 
             foreach (var comp in snapshot)
@@ -513,7 +568,6 @@ namespace LustDaddy
                 if (comp == null) continue;
                 var fields = _editableFields.ContainsKey(comp) ? _editableFields[comp] : new List<CustomField>();
 
-                // Show component header + field editors
                 string compName = comp.GetType().Name;
                 if (comp is Object o) compName += $" ({o.name})";
                 GUILayout.Space(10);
@@ -538,11 +592,12 @@ namespace LustDaddy
 
                 if (_currentTab == Tab.Turrets)
                     DrawWeaponStations(comp);
+
+                if (_needsRefreshSelected) break;
             }
         }
         #endregion
 
-        // ════════════════════════════════════════════════════════════════════
         #region Config UI
         private void DrawConfigUI(GameObject rootGO)
         {
@@ -555,7 +610,7 @@ namespace LustDaddy
             string configPath = Path.Combine(LustDaddyStartup.ConfigDirectory, rootGO.name + ".json");
             bool hasConfig = File.Exists(configPath);
             if (hasConfig)
-                GUILayout.Label("  \u2713 Config saved \u2014 restart game to apply",
+                GUILayout.Label("  ✓ Config saved — restart game to apply",
                     new GUIStyle(GUI.skin.label) { normal = { textColor = Color.green } });
 
             if (_currentTab == Tab.Units)
@@ -600,15 +655,41 @@ namespace LustDaddy
                         GUILayout.BeginHorizontal();
                         GUILayout.Label(slotName, GUILayout.Width(160));
                         int cur = _unitSlotAssignments[slotName];
-                        _unitSlotAssignments[slotName] = DrawCycler("", cur, sourceNames, 400, Color.cyan);
+                        _unitSlotAssignments[slotName] = DrawCyclerWithSearch("", cur, sourceNames, 400, Color.cyan, _unitSlotSearch, slotName);
                         GUILayout.EndHorizontal();
                     }
                 }
             }
 
+            GUILayout.Space(8);
+            GUILayout.Label("─── Advanced Patching (ModuleManager-style) ───",
+                new GUIStyle(GUI.skin.label) { fontStyle = FontStyle.Bold, normal = { textColor = Color.yellow } });
+
+            string key = rootGO.name;
+            if (!_pendingPass.ContainsKey(key)) _pendingPass[key] = "";
+            if (!_pendingNeeds.ContainsKey(key)) _pendingNeeds[key] = "";
+            if (!_pendingNewUnitId.ContainsKey(key)) _pendingNewUnitId[key] = "";
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Pass (e.g. FOR[MyPatch], AFTER[Other]):", GUILayout.Width(260));
+            _pendingPass[key] = GUILayout.TextField(_pendingPass[key], GUILayout.Width(200));
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Needs (e.g. SomeMod|!OtherMod):", GUILayout.Width(260));
+            _pendingNeeds[key] = GUILayout.TextField(_pendingNeeds[key], GUILayout.Width(200));
+            GUILayout.EndHorizontal();
+
             GUILayout.Space(6);
             if (GUILayout.Button("Save Config (restart to apply)", GUILayout.Height(28)))
-                SaveConfig(rootGO);
+                SaveConfig(rootGO, isCopy: false, newUnitId: null);
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("New unit name for copy:", GUILayout.Width(180));
+            _pendingNewUnitId[key] = GUILayout.TextField(_pendingNewUnitId[key], GUILayout.Width(200));
+            GUILayout.EndHorizontal();
+            if (GUILayout.Button("Save As Copy (+) — clone into a new hybrid unit", GUILayout.Height(28)))
+                SaveConfig(rootGO, isCopy: true, newUnitId: _pendingNewUnitId[key]);
 
             if (hasConfig && GUILayout.Button("Clear Config"))
             {
@@ -617,9 +698,25 @@ namespace LustDaddy
             }
         }
 
-        private void SaveConfig(GameObject rootGO)
+        private void SaveConfig(GameObject rootGO, bool isCopy, string newUnitId)
         {
-            var config = new UnitModConfig { unitId = rootGO.name };
+            string key = rootGO.name;
+            string pass = _pendingPass.TryGetValue(key, out var pv) ? pv : null;
+            string needs = _pendingNeeds.TryGetValue(key, out var nv) ? nv : null;
+
+            if (isCopy && string.IsNullOrEmpty(newUnitId))
+            {
+                Debug.LogWarning("[LustDaddy] Cannot save copy: new unit name is empty.");
+                return;
+            }
+
+            var config = new UnitModConfig
+            {
+                unitId = (isCopy ? "+" : "") + rootGO.name,
+                newUnitId = isCopy ? newUnitId : null,
+                pass = string.IsNullOrEmpty(pass) ? null : pass,
+                needs = string.IsNullOrEmpty(needs) ? null : needs
+            };
 
             if (_currentTab == Tab.Units)
             {
@@ -648,10 +745,8 @@ namespace LustDaddy
                 }
             }
 
-            // Save weapon station modifications
             if (_currentTab == Tab.Turrets)
             {
-                // Find weapon station holders and their swapped indices
                 var validSources = _sourceTurretGOs;
                 int stationUiIndex = 0;
                 foreach (var comp in _selectedComponents)
@@ -661,7 +756,7 @@ namespace LustDaddy
                     var stations = wsField.GetValue(comp) as System.Collections.IList;
                     if (stations == null) continue;
                     string compName = comp.GetType().Name;
-                    
+
                     for (int i = 0; i < stations.Count; i++)
                     {
                         if (_stationSwapIndices.ContainsKey(stationUiIndex))
@@ -682,16 +777,15 @@ namespace LustDaddy
                 }
             }
 
-            // Save field modifications
             foreach (var comp in _selectedComponents)
             {
                 if (comp == null || !_editableFields.ContainsKey(comp) || !_originalValues.ContainsKey(comp)) continue;
                 var compName = comp.GetType().Name;
                 foreach (var field in _editableFields[comp])
                 {
-                    if (field.FieldType != typeof(float) && field.FieldType != typeof(int) && 
+                    if (field.FieldType != typeof(float) && field.FieldType != typeof(int) &&
                         field.FieldType != typeof(bool) && field.FieldType != typeof(string) && !field.FieldType.IsEnum) continue;
-                        
+
                     if (!_originalValues[comp].ContainsKey(field.Name)) continue;
                     object origVal = _originalValues[comp][field.Name];
                     object curVal = field.GetValue(comp);
@@ -708,15 +802,19 @@ namespace LustDaddy
                 }
             }
 
-            if (config.turretSwaps.Count == 0 && config.fieldMods.Count == 0 && config.stationSwaps.Count == 0) { Debug.Log("[LustDaddy] Nothing to save."); return; }
+            if (!isCopy && config.turretSwaps.Count == 0 && config.fieldMods.Count == 0 && config.stationSwaps.Count == 0)
+            {
+                Debug.Log("[LustDaddy] Nothing to save.");
+                return;
+            }
             Directory.CreateDirectory(LustDaddyStartup.ConfigDirectory);
             string json = config.ToJson();
-            File.WriteAllText(Path.Combine(LustDaddyStartup.ConfigDirectory, rootGO.name + ".json"), json);
-            Debug.Log($"[LustDaddy] Config saved for '{rootGO.name}':\n{json}");
+            string fileName = isCopy ? $"{rootGO.name}_to_{newUnitId}.json" : $"{rootGO.name}.json";
+            File.WriteAllText(Path.Combine(LustDaddyStartup.ConfigDirectory, fileName), json);
+            Debug.Log($"[LustDaddy] Config saved to '{fileName}':\n{json}");
         }
         #endregion
 
-        // ════════════════════════════════════════════════════════════════════
         #region Weapon Stations (Turrets tab only)
         private void DrawWeaponStations(Object comp)
         {
@@ -734,9 +832,7 @@ namespace LustDaddy
 
             string[] prefabNames = _sourceTurretGOs.Select(t => t.name).ToArray();
 
-            // We need a global index into _stationSwapIndices because DrawWeaponStations is called per-component
-            // but the dictionary is shared. Alternatively, re-initialize it based on the current physical turret.
-            int stationUiIndex = 0; // We must find out where this component's stations start in the UI
+            int stationUiIndex = 0;
             foreach(var c in _selectedComponents)
             {
                 if (c == comp) break;
@@ -759,11 +855,14 @@ namespace LustDaddy
 
                 GUILayout.Space(4);
                 int oldIdx = _stationSwapIndices[stationUiIndex];
-                int newIdx = DrawCycler($"Station {i} Turret:", oldIdx, prefabNames, 200, Color.cyan);
+                int newIdx = DrawCyclerWithSearch($"Station {i} Turret:", oldIdx, prefabNames, 200, Color.cyan, _stationSwapSearch, stationUiIndex.ToString());
                 _stationSwapIndices[stationUiIndex] = newIdx;
 
                 if (newIdx != oldIdx && prefabNames.Length > 0)
+                {
                     SwapStationTurret(comp as Component, i, _sourceTurretGOs[newIdx]);
+                    return;
+                }
 
                 var wi     = GetMemberValue(station, "WeaponInfo") as Object;
                 string wiName = wi != null ? wi.name : "None";
@@ -790,6 +889,25 @@ namespace LustDaddy
                 return wc.gameObject.name;
             }
             return "None";
+        }
+
+        private int DrawCyclerWithSearch(string label, int index, string[] options, int valueWidth, Color valueColor, IDictionary<string, string> searchStore, string searchKey)
+        {
+            if (!searchStore.TryGetValue(searchKey, out string search)) search = "";
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(label, GUILayout.Width(130));
+            string newSearch = GUILayout.TextField(search, GUILayout.Width(100));
+            GUILayout.EndHorizontal();
+
+            if (newSearch != search && !string.IsNullOrEmpty(newSearch))
+            {
+                int matchIdx = Array.FindIndex(options, o => o.IndexOf(newSearch, StringComparison.OrdinalIgnoreCase) >= 0);
+                if (matchIdx >= 0) index = matchIdx;
+            }
+            searchStore[searchKey] = newSearch;
+
+            return DrawCycler(label, index, options, valueWidth, valueColor);
         }
 
         private int DrawCycler(string label, int index, string[] options, int valueWidth, Color valueColor)
@@ -852,7 +970,6 @@ namespace LustDaddy
             newGO.transform.localRotation = oldGO.transform.localRotation;
             newGO.transform.localScale    = oldGO.transform.localScale;
 
-            // Wire unit refs
             Component unitComp = TryFindUnitStatic(stationHolder);
             if (unitComp != null) SetTurretUnitReferencesStatic(newGO, unitComp);
 
@@ -883,15 +1000,14 @@ namespace LustDaddy
         {
             if (stationHolder == null || newTurretPrefab == null) return;
             SwapStationTurretStatic(stationHolder, stationIndex, newTurretPrefab);
-            
-            // Re-fetch the newly modified station info to print the log correctly
+
             var wsField = GetFieldRecursivelyStatic(stationHolder.GetType(), "weaponStations");
             var stations = wsField?.GetValue(stationHolder) as System.Collections.IList;
             var station = stations != null && stationIndex < stations.Count ? stations[stationIndex] : null;
             Object newWi = station != null ? GetMemberValueStatic(station, "WeaponInfo") as Object : null;
-            
+
             ApplySwapToInstances(stationHolder, stationIndex, newTurretPrefab);
-            
+
             _needsRefreshSelected = true;
             Debug.Log($"[LustDaddy] Swapped station {stationIndex} on '{stationHolder.gameObject.name}' -> '{newTurretPrefab.name}' (WI: {(newWi != null ? newWi.name : "None")})");
         }
@@ -915,7 +1031,6 @@ namespace LustDaddy
             return null;
         }
 
-        // Overload for when we already have the unitGO directly
         private Component TryFindUnit(GameObject unitGO)
         {
             if (unitGO == null) return null;
@@ -923,7 +1038,6 @@ namespace LustDaddy
             if (unitType == null) return null;
             var c = unitGO.GetComponent(unitType);
             if (c != null) return c as Component;
-            // Also check children (some units have Unit on a child)
             foreach (var cc in unitGO.GetComponentsInChildren(unitType, true))
                 if (cc != null) return cc as Component;
             return null;
@@ -931,7 +1045,6 @@ namespace LustDaddy
 
         private void ApplySwapToInstances(Component stationHolder, int stationIndex, GameObject newTurretPrefab)
         {
-            // Walk up to find the root prefab GO
             GameObject rootGO = stationHolder.gameObject;
             while (rootGO.transform.parent != null) rootGO = rootGO.transform.parent.gameObject;
 
@@ -958,7 +1071,6 @@ namespace LustDaddy
         }
         #endregion
 
-        // ════════════════════════════════════════════════════════════════════
         #region Reflection Helpers
         private static FieldInfo GetFieldRecursivelyStatic(Type type, string fieldName)
         {
@@ -978,7 +1090,7 @@ namespace LustDaddy
             }
             return null;
         }
-        
+
         private FieldInfo GetFieldRecursively(Type type, string fieldName) => GetFieldRecursivelyStatic(type, fieldName);
 
         private static PropertyInfo GetPropertyRecursivelyStatic(Type type, string propName)
@@ -999,7 +1111,7 @@ namespace LustDaddy
             }
             return null;
         }
-        
+
         private PropertyInfo GetPropertyRecursively(Type type, string propName) => GetPropertyRecursivelyStatic(type, propName);
 
         private static object GetMemberValueStatic(object obj, string name)
@@ -1071,11 +1183,10 @@ namespace LustDaddy
                 }
             }
         }
-        
+
         private void ReplaceCollection(object parent, string fieldName, List<Component> newItems) => ReplaceCollectionStatic(parent, fieldName, newItems);
         #endregion
 
-        // ════════════════════════════════════════════════════════════════════
         #region Field Editors
         private string PrettifyName(string name)
         {
@@ -1212,7 +1323,6 @@ namespace LustDaddy
         }
         #endregion
 
-        // ════════════════════════════════════════════════════════════════════
         #region Nuclear Automation
         private void DiscoverNukePrefab()
         {
@@ -1256,7 +1366,6 @@ namespace LustDaddy
         }
         #endregion
 
-        // ════════════════════════════════════════════════════════════════════
         #region Turret Wiring
         private static bool IsTypeOrSubclassStatic(Type type, string name)
         {
@@ -1280,9 +1389,60 @@ namespace LustDaddy
                     SetMemberValueStatic(part, "attachedUnit", parentUnit);
                 else if (IsTypeOrSubclassStatic(type, "Gun") && rb != null)
                     SetMemberValueStatic(part, "velocityInherit", rb);
+
+                if (IsTypeOrSubclassStatic(type, "Turret"))
+                    TryAttachTurretToWeaponManager(part, parentUnit);
             }
         }
-        
+
+        public static void TryAttachTurretToWeaponManager(Component turretComp, Component unitComp)
+        {
+            if (turretComp == null || unitComp == null) return;
+            try
+            {
+                var turretType = turretComp.GetType();
+                MethodInfo attachMethod = null;
+                var t = turretType;
+                while (t != null && t != typeof(object))
+                {
+                    attachMethod = t.GetMethod("AttachToWeaponManager", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (attachMethod != null) break;
+                    t = t.BaseType;
+                }
+                if (attachMethod == null) return;
+
+                var pars = attachMethod.GetParameters();
+                if (pars.Length != 1 || !pars[0].ParameterType.IsInstanceOfType(unitComp)) return;
+                attachMethod.Invoke(turretComp, new object[] { unitComp });
+
+                object acqMode = GetMemberValueStatic(turretComp, "targetAcquisitionMode");
+                if (acqMode != null && acqMode.ToString() == "parentUnitTargetDetector")
+                {
+                    object radar = GetMemberValueStatic(unitComp, "radar");
+                    if (radar != null)
+                    {
+                        var registerMethod = FindMethodRecursive(turretType, "RegisterTargetDetector");
+                        registerMethod?.Invoke(turretComp, new object[] { radar });
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[LustDaddy] Failed to attach turret to weapon manager: {ex.Message}");
+            }
+        }
+
+        private static MethodInfo FindMethodRecursive(Type type, string methodName)
+        {
+            while (type != null && type != typeof(object))
+            {
+                var m = type.GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (m != null) return m;
+                type = type.BaseType;
+            }
+            return null;
+        }
+
         private static Component TryFindUnitStatic(Component comp)
         {
             if (comp == null) return null;
