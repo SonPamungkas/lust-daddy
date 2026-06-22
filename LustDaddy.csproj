@@ -16,11 +16,10 @@
     <NoWarn>CS1701;CS1702;NU1605</NoWarn>
     <GameDir Condition="'$(GameDir)'==''">C:\Program Files\Steam\steamapps\common\Nuclear Option</GameDir>
   </PropertyGroup>
- 
+
   <ItemGroup>
     <Compile Remove="qol_decompiled.cs" />
     <Compile Remove="nucleareverything.cs" />
-    <!-- Reference-only directories — do NOT compile these -->
     <Compile Remove="Kar_decompiled\**\*.cs" />
     <Compile Remove="BoscaliOceanTrainingExercise-main\**\*.cs" />
     <Compile Remove="refrence\**\*.cs" />
