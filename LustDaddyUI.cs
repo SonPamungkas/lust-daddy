@@ -1,14 +1,14 @@
 using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Reflection;
-using System.Text.RegularExpressions;
-using BepInEx;
-using BepInEx.Configuration;
-using HarmonyLib;
-using UnityEngine;
-using Object = UnityEngine.Object;
+ using System.Collections.Generic;
+ using System.IO;
+ using System.Linq;
+ using System.Reflection;
+ using System.Text.RegularExpressions;
+ using BepInEx;
+ using BepInEx.Configuration;
+ using HarmonyLib;
+ using UnityEngine;
+ using Object = UnityEngine.Object;
 
 namespace LustDaddy
 {
@@ -17,29 +17,60 @@ namespace LustDaddy
         public class CustomField
         {
             public string Name;
+            public string DisplayName;
             public Type FieldType;
-            public FieldInfo RootField;
-            public FieldInfo SubField;
 
-            public object GetValue(object comp)
-            {
-                if (SubField == null) return RootField.GetValue(comp);
-                object rootVal = RootField.GetValue(comp);
-                if (rootVal == null) return null;
-                return SubField.GetValue(rootVal);
-            }
+            public object GetValue(object comp) => GetDeepFieldValue(comp, Name);
+            public void SetValue(object comp, object value) => LustDaddyStartup.ApplyDeepFieldMod(comp, Name, value.ToString());
+        }
 
-            public void SetValue(object comp, object value)
+        public static object GetDeepFieldValue(object rootTarget, string path)
+        {
+            var parts = path.Split('.');
+            object current = rootTarget;
+            
+            for (int i = 0; i < parts.Length; i++)
             {
-                if (SubField == null) RootField.SetValue(comp, value);
+                if (current == null) return null;
+                string part = parts[i].Trim();
+                int bracketIndex = part.IndexOf('[');
+                string memberName = bracketIndex >= 0 ? part.Substring(0, bracketIndex).Trim() : part;
+                int? index = null;
+                if (bracketIndex >= 0)
+                {
+                    int bracketEnd = part.IndexOf(']', bracketIndex);
+                    if (bracketEnd >= 0)
+                        index = int.Parse(part.Substring(bracketIndex + 1, bracketEnd - bracketIndex - 1).Trim());
+                }
+
+                Type t = current.GetType();
+                MemberInfo member = null;
+                while (t != null && t != typeof(object))
+                {
+                    member = t.GetField(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (member == null) member = t.GetProperty(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (member != null) break;
+                    t = t.BaseType;
+                }
+
+                if (member == null) return null;
+
+                object memberValue = null;
+                if (member is FieldInfo fi) memberValue = fi.GetValue(current);
+                else if (member is PropertyInfo pi) memberValue = pi.GetValue(current, null);
+
+                if (index.HasValue && memberValue != null)
+                {
+                    if (memberValue is Array arr && index.Value < arr.Length) current = arr.GetValue(index.Value);
+                    else if (memberValue is System.Collections.IList list && index.Value < list.Count) current = list[index.Value];
+                    else return null;
+                }
                 else
                 {
-                    object rootVal = RootField.GetValue(comp);
-                    if (rootVal == null) return;
-                    SubField.SetValue(rootVal, value);
-                    RootField.SetValue(comp, rootVal);
+                    current = memberValue;
                 }
             }
+            return current;
         }
 
         private bool _showWindow = false;
@@ -96,10 +127,6 @@ namespace LustDaddy
         private int _unitTurretSlotIndex  = 0;
         private int _unitTurretSwapIndex  = 0;
         private Dictionary<string, int> _unitSlotAssignments = new Dictionary<string, int>();
-
-        private Dictionary<string, string> _pendingPass = new Dictionary<string, string>();
-        private Dictionary<string, string> _pendingNeeds = new Dictionary<string, string>();
-        private Dictionary<string, string> _pendingNewUnitId = new Dictionary<string, string>();
 
         #region Unity Lifecycle
         private void Update()
@@ -390,7 +417,7 @@ namespace LustDaddy
 
             if (selected is ScriptableObject scriptable)
             {
-                var fields = GetEditableFields(scriptable.GetType());
+                var fields = GetEditableFields(scriptable);
                 if (fields.Count > 0)
                 {
                     _selectedComponents.Add(scriptable);
@@ -416,7 +443,7 @@ namespace LustDaddy
                 if (t.Namespace != null && t.Namespace.StartsWith("UnityEngine")) continue;
 
                 var wsField = GetFieldRecursively(t, "weaponStations");
-                var fields  = GetEditableFields(t);
+                var fields  = GetEditableFields(comp);
                 if (fields.Count > 0 || wsField != null)
                 {
                     _selectedComponents.Add(comp);
@@ -430,7 +457,7 @@ namespace LustDaddy
                 Type turretType = Type.GetType("Turret, Assembly-CSharp");
                 Type gunType = Type.GetType("Gun, Assembly-CSharp");
                 Type launcherType = Type.GetType("MissileLauncher, Assembly-CSharp");
-
+                
                 var seen = new HashSet<GameObject>();
                 var comps = new List<Component>();
                 if (turretType != null) comps.AddRange(go.GetComponentsInChildren(turretType, true));
@@ -441,7 +468,7 @@ namespace LustDaddy
                 {
                     if (c == null) continue;
                     var slotGO = c.gameObject;
-
+                    
                     bool hasTurretParent = false;
                     Transform p = slotGO.transform.parent;
                     while (p != null)
@@ -502,48 +529,114 @@ namespace LustDaddy
             }
         }
 
-        private List<CustomField> GetEditableFields(Type type)
+        private List<CustomField> GetEditableFields(Object comp)
         {
-            var fields = type.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            var result = new List<CustomField>();
+            ExtractFields(comp, comp, "", result);
+            if (_guiMode == GuiMode.Lite)
+                result = result.Where(f => IsLiteField(f.Name)).ToList();
+            return result;
+        }
+
+        private void ExtractFields(object rootObj, object targetObj, string prefix, List<CustomField> result)
+        {
+            if (targetObj == null) return;
+            Type t = targetObj.GetType();
+
+            var fields = t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
                 .Where(f => !f.IsInitOnly && !f.IsLiteral)
                 .Where(f => f.IsPublic || f.GetCustomAttribute<SerializeField>() != null);
 
-            var result = new List<CustomField>();
             foreach (var f in fields)
             {
-                if (IsSupportedType(f.FieldType))
+                string path = string.IsNullOrEmpty(prefix) ? f.Name : prefix + "." + f.Name;
+                Type ft = f.FieldType;
+                object val = null;
+                try { val = f.GetValue(targetObj); } catch { continue; }
+
+                if (IsSupportedType(ft))
                 {
-                    result.Add(new CustomField { Name = f.Name, FieldType = f.FieldType, RootField = f });
+                    result.Add(new CustomField { Name = path, DisplayName = f.Name, FieldType = ft });
                 }
-                else if (f.FieldType.IsValueType || f.FieldType.IsClass)
+                else if (ft.IsArray || typeof(System.Collections.IList).IsAssignableFrom(ft))
                 {
-                    if (f.FieldType.GetCustomAttribute<SerializableAttribute>() != null || f.FieldType.Name.Contains("Params") || f.FieldType.Name.Contains("Parameters"))
+                    if (val is System.Collections.IList list)
                     {
-                        var subFields = f.FieldType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                            .Where(sf => !sf.IsInitOnly && !sf.IsLiteral)
-                            .Where(sf => sf.IsPublic || sf.GetCustomAttribute<SerializeField>() != null);
-                        foreach(var sf in subFields)
+                        for (int i = 0; i < list.Count; i++)
                         {
-                            if (IsSupportedType(sf.FieldType))
+                            object elem = list[i];
+                            if (elem != null)
                             {
-                                result.Add(new CustomField { Name = f.Name + "." + sf.Name, FieldType = sf.FieldType, RootField = f, SubField = sf });
+                                string elemPath = path + "[" + i + "]";
+                                ExtractFields(rootObj, elem, elemPath, result);
+                            }
+                        }
+                    }
+                }
+                else if (ft.IsValueType || ft.IsClass)
+                {
+                    if (ft.GetCustomAttribute<SerializableAttribute>() != null || ft.Name.Contains("Params") || ft.Name.Contains("Parameters") || ft == typeof(AnimationCurve))
+                    {
+                        if (val != null)
+                        {
+                            if (ft == typeof(AnimationCurve))
+                            {
+                                var keysProp = ft.GetProperty("keys");
+                                if (keysProp != null)
+                                {
+                                    var keys = keysProp.GetValue(val, null) as Array;
+                                    if (keys != null)
+                                    {
+                                        for (int i = 0; i < keys.Length; i++)
+                                        {
+                                            object keyElem = keys.GetValue(i);
+                                            string elemPath = path + ".keys[" + i + "]";
+                                            ExtractProperties(rootObj, keyElem, elemPath, result);
+                                        }
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                ExtractFields(rootObj, val, path, result);
                             }
                         }
                     }
                 }
             }
-            if (_guiMode == GuiMode.Lite)
-                result = result.Where(f => IsLiteField(f.SubField != null ? f.SubField.Name : f.Name)).ToList();
-            return result;
+        }
+
+        private void ExtractProperties(object rootObj, object targetObj, string prefix, List<CustomField> result)
+        {
+            if (targetObj == null) return;
+            Type t = targetObj.GetType();
+
+            var props = t.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                .Where(p => p.CanRead && p.CanWrite);
+
+            foreach (var p in props)
+            {
+                string path = string.IsNullOrEmpty(prefix) ? p.Name : prefix + "." + p.Name;
+                Type pt = p.PropertyType;
+
+                if (IsSupportedType(pt))
+                {
+                    result.Add(new CustomField { Name = path, DisplayName = p.Name, FieldType = pt });
+                }
+            }
         }
 
         private void CacheOriginalValues(Object obj, List<CustomField> fields)
         {
-            if (_originalValues.ContainsKey(obj)) return;
-            var orig = new Dictionary<string, object>();
+            if (!_originalValues.ContainsKey(obj)) _originalValues[obj] = new Dictionary<string, object>();
+            var orig = _originalValues[obj];
             foreach (var f in fields)
-                try { orig[f.Name] = f.GetValue(obj); } catch { }
-            _originalValues[obj] = orig;
+            {
+                if (!orig.ContainsKey(f.Name))
+                {
+                    try { orig[f.Name] = f.GetValue(obj); } catch { }
+                }
+            }
         }
 
         private bool IsSupportedType(Type t) =>
@@ -588,7 +681,32 @@ namespace LustDaddy
                 }
                 GUILayout.EndHorizontal();
 
-                foreach (var f in fields) DrawFieldEditor(comp, f);
+                string lastHeader = "";
+                foreach (var f in fields)
+                {
+                    string currentHeader = "";
+                    int dotIndex = f.Name.LastIndexOf('.');
+                    if (dotIndex > 0)
+                    {
+                        currentHeader = f.Name.Substring(0, dotIndex);
+                    }
+                    
+                    if (currentHeader != lastHeader)
+                    {
+                        if (!string.IsNullOrEmpty(currentHeader))
+                        {
+                            GUILayout.Space(5);
+                            GUILayout.Label($"  └─ {currentHeader}", new GUIStyle(GUI.skin.label) { fontStyle = FontStyle.Italic, normal = { textColor = new Color(0.8f, 0.8f, 0.8f) } });
+                        }
+                        else
+                        {
+                            GUILayout.Space(5);
+                        }
+                        lastHeader = currentHeader;
+                    }
+                    
+                    DrawFieldEditor(comp, f);
+                }
 
                 if (_currentTab == Tab.Turrets)
                     DrawWeaponStations(comp);
@@ -610,7 +728,7 @@ namespace LustDaddy
             string configPath = Path.Combine(LustDaddyStartup.ConfigDirectory, rootGO.name + ".json");
             bool hasConfig = File.Exists(configPath);
             if (hasConfig)
-                GUILayout.Label("  ✓ Config saved — restart game to apply",
+                GUILayout.Label("  \u2713 Config saved \u2014 restart game to apply",
                     new GUIStyle(GUI.skin.label) { normal = { textColor = Color.green } });
 
             if (_currentTab == Tab.Units)
@@ -661,35 +779,9 @@ namespace LustDaddy
                 }
             }
 
-            GUILayout.Space(8);
-            GUILayout.Label("─── Advanced Patching (ModuleManager-style) ───",
-                new GUIStyle(GUI.skin.label) { fontStyle = FontStyle.Bold, normal = { textColor = Color.yellow } });
-
-            string key = rootGO.name;
-            if (!_pendingPass.ContainsKey(key)) _pendingPass[key] = "";
-            if (!_pendingNeeds.ContainsKey(key)) _pendingNeeds[key] = "";
-            if (!_pendingNewUnitId.ContainsKey(key)) _pendingNewUnitId[key] = "";
-
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("Pass (e.g. FOR[MyPatch], AFTER[Other]):", GUILayout.Width(260));
-            _pendingPass[key] = GUILayout.TextField(_pendingPass[key], GUILayout.Width(200));
-            GUILayout.EndHorizontal();
-
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("Needs (e.g. SomeMod|!OtherMod):", GUILayout.Width(260));
-            _pendingNeeds[key] = GUILayout.TextField(_pendingNeeds[key], GUILayout.Width(200));
-            GUILayout.EndHorizontal();
-
             GUILayout.Space(6);
             if (GUILayout.Button("Save Config (restart to apply)", GUILayout.Height(28)))
-                SaveConfig(rootGO, isCopy: false, newUnitId: null);
-
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("New unit name for copy:", GUILayout.Width(180));
-            _pendingNewUnitId[key] = GUILayout.TextField(_pendingNewUnitId[key], GUILayout.Width(200));
-            GUILayout.EndHorizontal();
-            if (GUILayout.Button("Save As Copy (+) — clone into a new hybrid unit", GUILayout.Height(28)))
-                SaveConfig(rootGO, isCopy: true, newUnitId: _pendingNewUnitId[key]);
+                SaveConfig(rootGO);
 
             if (hasConfig && GUILayout.Button("Clear Config"))
             {
@@ -698,25 +790,9 @@ namespace LustDaddy
             }
         }
 
-        private void SaveConfig(GameObject rootGO, bool isCopy, string newUnitId)
+        private void SaveConfig(GameObject rootGO)
         {
-            string key = rootGO.name;
-            string pass = _pendingPass.TryGetValue(key, out var pv) ? pv : null;
-            string needs = _pendingNeeds.TryGetValue(key, out var nv) ? nv : null;
-
-            if (isCopy && string.IsNullOrEmpty(newUnitId))
-            {
-                Debug.LogWarning("[LustDaddy] Cannot save copy: new unit name is empty.");
-                return;
-            }
-
-            var config = new UnitModConfig
-            {
-                unitId = (isCopy ? "+" : "") + rootGO.name,
-                newUnitId = isCopy ? newUnitId : null,
-                pass = string.IsNullOrEmpty(pass) ? null : pass,
-                needs = string.IsNullOrEmpty(needs) ? null : needs
-            };
+            var config = new UnitModConfig { unitId = rootGO.name };
 
             if (_currentTab == Tab.Units)
             {
@@ -756,7 +832,7 @@ namespace LustDaddy
                     var stations = wsField.GetValue(comp) as System.Collections.IList;
                     if (stations == null) continue;
                     string compName = comp.GetType().Name;
-
+                    
                     for (int i = 0; i < stations.Count; i++)
                     {
                         if (_stationSwapIndices.ContainsKey(stationUiIndex))
@@ -783,9 +859,9 @@ namespace LustDaddy
                 var compName = comp.GetType().Name;
                 foreach (var field in _editableFields[comp])
                 {
-                    if (field.FieldType != typeof(float) && field.FieldType != typeof(int) &&
+                    if (field.FieldType != typeof(float) && field.FieldType != typeof(int) && 
                         field.FieldType != typeof(bool) && field.FieldType != typeof(string) && !field.FieldType.IsEnum) continue;
-
+                        
                     if (!_originalValues[comp].ContainsKey(field.Name)) continue;
                     object origVal = _originalValues[comp][field.Name];
                     object curVal = field.GetValue(comp);
@@ -802,16 +878,11 @@ namespace LustDaddy
                 }
             }
 
-            if (!isCopy && config.turretSwaps.Count == 0 && config.fieldMods.Count == 0 && config.stationSwaps.Count == 0)
-            {
-                Debug.Log("[LustDaddy] Nothing to save.");
-                return;
-            }
+            if (config.turretSwaps.Count == 0 && config.fieldMods.Count == 0 && config.stationSwaps.Count == 0) { Debug.Log("[LustDaddy] Nothing to save."); return; }
             Directory.CreateDirectory(LustDaddyStartup.ConfigDirectory);
             string json = config.ToJson();
-            string fileName = isCopy ? $"{rootGO.name}_to_{newUnitId}.json" : $"{rootGO.name}.json";
-            File.WriteAllText(Path.Combine(LustDaddyStartup.ConfigDirectory, fileName), json);
-            Debug.Log($"[LustDaddy] Config saved to '{fileName}':\n{json}");
+            File.WriteAllText(Path.Combine(LustDaddyStartup.ConfigDirectory, rootGO.name + ".json"), json);
+            Debug.Log($"[LustDaddy] Config saved for '{rootGO.name}':\n{json}");
         }
         #endregion
 
@@ -1000,14 +1071,14 @@ namespace LustDaddy
         {
             if (stationHolder == null || newTurretPrefab == null) return;
             SwapStationTurretStatic(stationHolder, stationIndex, newTurretPrefab);
-
+            
             var wsField = GetFieldRecursivelyStatic(stationHolder.GetType(), "weaponStations");
             var stations = wsField?.GetValue(stationHolder) as System.Collections.IList;
             var station = stations != null && stationIndex < stations.Count ? stations[stationIndex] : null;
             Object newWi = station != null ? GetMemberValueStatic(station, "WeaponInfo") as Object : null;
-
+            
             ApplySwapToInstances(stationHolder, stationIndex, newTurretPrefab);
-
+            
             _needsRefreshSelected = true;
             Debug.Log($"[LustDaddy] Swapped station {stationIndex} on '{stationHolder.gameObject.name}' -> '{newTurretPrefab.name}' (WI: {(newWi != null ? newWi.name : "None")})");
         }
@@ -1090,7 +1161,7 @@ namespace LustDaddy
             }
             return null;
         }
-
+        
         private FieldInfo GetFieldRecursively(Type type, string fieldName) => GetFieldRecursivelyStatic(type, fieldName);
 
         private static PropertyInfo GetPropertyRecursivelyStatic(Type type, string propName)
@@ -1111,7 +1182,7 @@ namespace LustDaddy
             }
             return null;
         }
-
+        
         private PropertyInfo GetPropertyRecursively(Type type, string propName) => GetPropertyRecursivelyStatic(type, propName);
 
         private static object GetMemberValueStatic(object obj, string name)
@@ -1183,7 +1254,7 @@ namespace LustDaddy
                 }
             }
         }
-
+        
         private void ReplaceCollection(object parent, string fieldName, List<Component> newItems) => ReplaceCollectionStatic(parent, fieldName, newItems);
         #endregion
 
@@ -1197,7 +1268,7 @@ namespace LustDaddy
         private void DrawFieldEditor(Object comp, CustomField field)
         {
             GUILayout.BeginHorizontal();
-            GUILayout.Label(PrettifyName(field.Name), GUILayout.Width(200));
+            GUILayout.Label(PrettifyName(field.DisplayName), GUILayout.Width(200));
             object value = field.GetValue(comp);
             Type t = field.FieldType;
             try
@@ -1442,7 +1513,7 @@ namespace LustDaddy
             }
             return null;
         }
-
+        
         private static Component TryFindUnitStatic(Component comp)
         {
             if (comp == null) return null;
