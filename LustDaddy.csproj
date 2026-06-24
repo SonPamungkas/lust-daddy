@@ -18,14 +18,6 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Remove="qol_decompiled.cs" />
-    <Compile Remove="nucleareverything.cs" />
-    <Compile Remove="Kar_decompiled\**\*.cs" />
-    <Compile Remove="BoscaliOceanTrainingExercise-main\**\*.cs" />
-    <Compile Remove="refrence\**\*.cs" />
-  </ItemGroup>
-
-  <ItemGroup>
     <Reference Include="BepInEx">
       <HintPath>$(GameDir)\BepInEx\core\BepInEx.dll</HintPath>
       <Private>false</Private>
