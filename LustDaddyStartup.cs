@@ -199,54 +199,128 @@ namespace LustDaddy
                 }
                 if (targetComp == null) continue;
 
-                var t = targetComp.GetType();
-                var parts = fieldMod.fieldName.Split('.');
-                FieldInfo f1 = null;
+                try
+                {
+                    ApplyDeepFieldMod(targetComp, fieldMod.fieldName, fieldMod.valueString);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[LustDaddy] Config '{file}': failed to apply field mod {fieldMod.fieldName}: {ex.Message}");
+                }
+            }
+        }
+
+        public static void ApplyDeepFieldMod(object rootTarget, string path, string valueString)
+        {
+            var parts = path.Split('.');
+            var segments = new List<(object target, MemberInfo member, int? index, object value)>();
+            
+            object current = rootTarget;
+            
+            for (int i = 0; i < parts.Length; i++)
+            {
+                string part = parts[i].Trim();
+                int bracketIndex = part.IndexOf('[');
+                string memberName = bracketIndex >= 0 ? part.Substring(0, bracketIndex).Trim() : part;
+                int? index = null;
+                if (bracketIndex >= 0)
+                {
+                    int bracketEnd = part.IndexOf(']', bracketIndex);
+                    if (bracketEnd >= 0)
+                        index = int.Parse(part.Substring(bracketIndex + 1, bracketEnd - bracketIndex - 1).Trim());
+                }
+
+                Type t = current.GetType();
+                MemberInfo member = null;
                 while (t != null && t != typeof(object))
                 {
-                    f1 = t.GetField(parts[0], BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                    if (f1 != null) break;
+                    member = t.GetField(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (member == null) member = t.GetProperty(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (member != null) break;
                     t = t.BaseType;
                 }
 
-                if (f1 != null)
+                if (member == null) throw new Exception($"Member '{memberName}' not found on type '{current.GetType().Name}'");
+
+                object memberValue = null;
+                if (member is FieldInfo fi) memberValue = fi.GetValue(current);
+                else if (member is PropertyInfo pi) memberValue = pi.GetValue(current, null);
+
+                segments.Add((current, member, null, memberValue));
+
+                if (index.HasValue && memberValue != null)
                 {
-                    try
-                    {
-                        FieldInfo targetField = f1;
-                        object subObj = null;
-                        if (parts.Length == 2)
-                        {
-                            subObj = f1.GetValue(targetComp);
-                            if (subObj != null)
-                            {
-                                targetField = subObj.GetType().GetField(parts[1], BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                            }
-                        }
-
-                        if (targetField != null)
-                        {
-                            object parsedVal = null;
-                            if (targetField.FieldType == typeof(float)) parsedVal = float.Parse(fieldMod.valueString.Replace(',', '.'), System.Globalization.CultureInfo.InvariantCulture);
-                            else if (targetField.FieldType == typeof(int)) parsedVal = int.Parse(fieldMod.valueString);
-                            else if (targetField.FieldType == typeof(bool)) parsedVal = bool.Parse(fieldMod.valueString);
-                            else if (targetField.FieldType == typeof(string)) parsedVal = fieldMod.valueString;
-                            else if (targetField.FieldType.IsEnum) parsedVal = Enum.Parse(targetField.FieldType, fieldMod.valueString, true);
-
-                            if (parsedVal != null)
-                            {
-                                if (parts.Length == 1) f1.SetValue(targetComp, parsedVal);
-                                else if (parts.Length == 2)
-                                {
-                                    targetField.SetValue(subObj, parsedVal);
-                                    f1.SetValue(targetComp, subObj);
-                                }
-                            }
-                        }
-                    }
-                    catch (Exception ex) { Debug.LogWarning($"[LustDaddy] Config '{file}': failed to apply field mod {fieldMod.fieldName}: {ex.Message}"); }
+                    object elemValue = null;
+                    if (memberValue is Array arr) elemValue = arr.GetValue(index.Value);
+                    else if (memberValue is System.Collections.IList list) elemValue = list[index.Value];
+                    else throw new Exception($"Member '{memberName}' of type '{memberValue.GetType().Name}' is not an array or IList, cannot index.");
+                    
+                    segments.Add((memberValue, null, index.Value, elemValue));
+                    current = elemValue;
+                }
+                else
+                {
+                    current = memberValue;
                 }
             }
+
+            var leafSegment = segments[segments.Count - 1];
+            object targetToSet = leafSegment.target;
+            
+            Type targetType = null;
+            if (leafSegment.member != null)
+                targetType = leafSegment.member is FieldInfo f ? f.FieldType : ((PropertyInfo)leafSegment.member).PropertyType;
+            else if (leafSegment.index.HasValue)
+            {
+                if (targetToSet is Array arr) targetType = arr.GetType().GetElementType();
+                else if (targetToSet is System.Collections.IList list) targetType = list.GetType().GetGenericArguments().FirstOrDefault() ?? typeof(object);
+            }
+            
+            object parsedVal = ParseValue(targetType, valueString);
+            if (parsedVal == null) throw new Exception($"Unsupported target type: {targetType} for value '{valueString}'");
+            
+            if (leafSegment.member != null)
+            {
+                if (leafSegment.member is FieldInfo f) f.SetValue(targetToSet, parsedVal);
+                else if (leafSegment.member is PropertyInfo p && p.CanWrite) p.SetValue(targetToSet, parsedVal, null);
+                else throw new Exception($"Cannot write to property '{leafSegment.member.Name}'");
+            }
+            else if (leafSegment.index.HasValue)
+            {
+                if (targetToSet is Array arr) arr.SetValue(parsedVal, leafSegment.index.Value);
+                else if (targetToSet is System.Collections.IList list) list[leafSegment.index.Value] = parsedVal;
+            }
+            
+            for (int i = segments.Count - 1; i > 0; i--)
+            {
+                var seg = segments[i];
+                var parentSeg = segments[i - 1];
+                
+                Type t = seg.target.GetType();
+                if (t.IsValueType || (parentSeg.member is PropertyInfo))
+                {
+                    if (parentSeg.member != null)
+                    {
+                        if (parentSeg.member is FieldInfo f) f.SetValue(parentSeg.target, seg.target);
+                        else if (parentSeg.member is PropertyInfo p && p.CanWrite) p.SetValue(parentSeg.target, seg.target, null);
+                    }
+                    else if (parentSeg.index.HasValue)
+                    {
+                        if (parentSeg.target is Array arr) arr.SetValue(seg.target, parentSeg.index.Value);
+                        else if (parentSeg.target is System.Collections.IList list) list[parentSeg.index.Value] = seg.target;
+                    }
+                }
+            }
+        }
+
+        static object ParseValue(Type type, string valueString)
+        {
+            if (type == typeof(float)) return float.Parse(valueString.Replace(',', '.'), System.Globalization.CultureInfo.InvariantCulture);
+            if (type == typeof(int)) return int.Parse(valueString);
+            if (type == typeof(bool)) return bool.Parse(valueString);
+            if (type == typeof(string)) return valueString;
+            if (type.IsEnum) return Enum.Parse(type, valueString, true);
+            return null;
         }
 
         static void ApplyStationSwaps(string file, UnitModConfig config, GameObject unitPrefab, Dictionary<string, GameObject> allGOs)
